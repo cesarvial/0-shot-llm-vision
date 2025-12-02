@@ -8,3 +8,8 @@ pillow
 requests
 timm
 pandas
+clip
+pycocotools
+matplotlib
+gradcam
+opencv-python

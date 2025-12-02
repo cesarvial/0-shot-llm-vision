@@ -1,385 +1,315 @@
-import torchvision.datasets as dset
-import torchvision.transforms as transforms
-from transformers import GPT2Tokenizer, GPT2Model, GPT2Config
-from torch.utils.data import DataLoader
-from transformers import ViTImageProcessor, ViTModel, ViTConfig, CLIPProcessor, CLIPModel
-from sentence_transformers import SentenceTransformer, models
-from transformers import AutoImageProcessor, AutoModel
-from transformers import ConvNextImageProcessor, ConvNextForImageClassification
-from transformers import AutoImageProcessor, DetrModel
-from transformers import SegformerForSemanticSegmentation
-from PIL import Image
-import argparse
-from torchvision.models.feature_extraction import create_feature_extractor
-from transformers import SamModel, SamProcessor
-from transformers import SegformerModel
-from transformers import DPTImageProcessor, DPTForDepthEstimation
-from transformers import AutoFeatureExtractor, ResNetForImageClassification
-import timm
-import numpy as np
+# get_embeds.py
+"""
+Full get_embeds.py adapted for your project layout (./coco_dataset).
 
+This script extracts image embeddings from several supported pretrained
+backbones and saves them as .pt files in a data/ directory.
 
-import torch, random
-from tqdm import tqdm
+Supported models (attempted in this order):
+  - dinov2   (via timm / huggingface if available)  -- name: 'dinov2'
+  - clip     (OpenAI CLIP, via the 'clip' package or HuggingFace)
+  - resnet50 (torchvision.models.resnet50) -- name: 'resnet50'
+  - any timm model name as fallback
+
+Usage examples:
+  python get_embeds.py --m dinov2 --d coco --split val2017 --gpu 0
+  python get_embeds.py --m clip --d coco --split train2017 --coco_root ./coco_dataset --batch_size 64
+
+Notes:
+ - You need `pycocotools`, `torch`, `torchvision`. For CLIP use `git+https://github.com/openai/CLIP.git` or `transformers`/`huggingface` equivalents.
+ - If a model package is missing, the script will raise an ImportError describing what to install.
+ - This script extracts global image embeddings. If you need patch/region embeddings, adapt the forward pass accordingly.
+"""
+
 import os
+import sys
+import argparse
+from pathlib import Path
+from tqdm import tqdm
 
-COCO_ROOT = "/datasets/coco2017_2024-01-04_1601/val2017"
-NOCAPS_ROOT = "/shared/group/openimages/validation"
-COCO_ANN = "/datasets/coco2017_2024-01-04_1601/annotations/captions_val2017.json"
-NOCAPS_ANN = "nocaps_val_4500_captions.json"
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import CocoCaptions
 
-def parse_args():
+# Helper: default COCO dataset layout in repo root
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+COCO_DATA_ROOT = os.path.join(PROJECT_ROOT, "coco_dataset")
+COCO_ROOT = os.path.join(COCO_DATA_ROOT, "val2017")
+COCO_ANN = os.path.join(COCO_DATA_ROOT, "annotations", "instances_val2017.json")
+
+
+def get_coco_paths(coco_root=None, split='val2017'):
     """
-    Parse the following arguments for a default parser
+    Return (images_dir, ann_file) for a COCO layout located in the project root under ./coco_dataset.
+    This prefers captions_{split}.json if present, otherwise falls back to instances_{split}.json.
     """
-    parser = argparse.ArgumentParser(
-        description="Running experiments"
-    )
-    parser.add_argument(
-        "--m",
-        dest="model_name",
-        help="model_name",
-        default="dinov2",
-        type=str,
-    )
-    parser.add_argument(
-        "--d",
-        dest="dataset",
-        help="dataset",
-        default="coco",
-        type=str,
-    )
-    parser.add_argument(
-        "--gpu",
-        dest="gpu",
-        help="gpu",
-        default=1,
-        type=int,
-    )
-    return parser.parse_args()
+    if coco_root is None:
+        coco_root = COCO_DATA_ROOT
+    coco_root = os.path.abspath(coco_root)
+    if split not in ('train2017', 'val2017'):
+        raise ValueError("--split must be 'train2017' or 'val2017'")
 
-class FeatureExtractor:
-    def __init__(self):
-        self.extracted_features = None
+    images_dir = os.path.join(coco_root, split)
 
-    def __call__(self, module, input_, output):
-        self.extracted_features = output
+    # prefer captions annotation file if available (required by CocoCaptions)
+    cap_fname = f'captions_{"train" if split=="train2017" else "val"}2017.json'
+    inst_fname = f'instances_{"train" if split=="train2017" else "val"}2017.json'
 
-def get_model(model_name, device):
-    
-    if model_name == "convnext":
-        processor = ConvNextImageProcessor.from_pretrained("facebook/convnext-base-224-22k")
-        model = ConvNextForImageClassification.from_pretrained("facebook/convnext-base-224-22k").to(device)
-        return model, processor
-    elif model_name == "dinov2":
-        vision_model_name = "facebook/dinov2-large"
-        processor = AutoImageProcessor.from_pretrained(vision_model_name)
-        model = AutoModel.from_pretrained(vision_model_name).to(device)
-        return model, processor
-    elif model_name == "clip":
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-        model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-        return model, processor
-    elif model_name == "allroberta":
-        language_model_name = "all-roberta-large-v1"
-        language_model = SentenceTransformer(language_model_name).to(device)
-        return language_model
-    elif model_name == "detr_resnet_50_encoder":
-        image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-50")
-        model = DetrModel.from_pretrained("facebook/detr-resnet-50").to(device)
-        
-        extractor = FeatureExtractor()
-        model.encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "detr_resnet_50_decoder":
-        image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-50")
-        model = DetrModel.from_pretrained("facebook/detr-resnet-50").to(device)
-        
-        extractor = FeatureExtractor()
-        model.decoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "detr_resnet_50_backbone":
-        image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-50")
-        model = DetrModel.from_pretrained("facebook/detr-resnet-50").to(device)
-        
-        extractor = FeatureExtractor()
-        model.backbone.conv_encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "detr_resnet_101_backbone":
-        image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-101")
-        model = DetrModel.from_pretrained("facebook/detr-resnet-101").to(device)
-        
-        extractor = FeatureExtractor()
-        model.backbone.conv_encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "detr_resnet_101_encoder":
-        image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-101")
-        model = DetrModel.from_pretrained("facebook/detr-resnet-101").to(device)
-        
-        extractor = FeatureExtractor()
-        model.encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "detr_resnet_101_decoder":
-        image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-101")
-        model = DetrModel.from_pretrained("facebook/detr-resnet-101").to(device)
-        
-        extractor = FeatureExtractor()
-        model.decoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "sam":
-        model = SamModel.from_pretrained("facebook/sam-vit-huge").to(device)
-        processor = SamProcessor.from_pretrained("facebook/sam-vit-huge")
-        
-        extractor = FeatureExtractor()
-        model.vision_encoder.layers[31].register_forward_hook(extractor)
-        return model
-    elif model_name == "sam_embed":
-        model = SamModel.from_pretrained("facebook/sam-vit-huge").to(device)
-        processor = SamProcessor.from_pretrained("facebook/sam-vit-huge")
-        
-        extractor = FeatureExtractor()
-        model.shared_image_embedding.register_forward_hook(extractor)
-        return model
-    elif model_name == "segformer":
-        processor = AutoImageProcessor.from_pretrained("nvidia/mit-b0")
-        model = SegformerModel.from_pretrained("nvidia/mit-b0").to(device)
+    ann_dir = os.path.join(coco_root, 'annotations')
+    cap_path = os.path.join(ann_dir, cap_fname)
+    inst_path = os.path.join(ann_dir, inst_fname)
 
-        extractor = FeatureExtractor()
-        model.encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "segformer_segment":
-        processor = AutoImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
-        model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512").to(device)
+    if os.path.isfile(cap_path):
+        ann_file = cap_path
+    elif os.path.isfile(inst_path):
+        ann_file = inst_path
+    else:
+        raise FileNotFoundError(f"Neither {cap_fname} nor {inst_fname} found in {ann_dir}")
 
-        extractor = FeatureExtractor()
-        model.segformer.encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "dpt":
-        processor = DPTImageProcessor.from_pretrained("Intel/dpt-large")
-        model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large").to(device)
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+    if not os.path.isfile(ann_file):
+        raise FileNotFoundError(f"Annotation file not found: {ann_file}")
 
-        extractor = FeatureExtractor()
-        model.dpt.encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "resnet101":
-        feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-101")
-        model = ResNetForImageClassification.from_pretrained("microsoft/resnet-101").to(device)
-
-        extractor = FeatureExtractor()
-        model.resnet.encoder.register_forward_hook(extractor)
-        return model
-    elif model_name == "vit":
-        model = timm.create_model(
-            'vit_base_patch16_384.augreg_in1k',
-            pretrained=True,
-            num_classes=0,  # remove classifier nn.Linear
-        ).to(device)
-        model = model.eval()
-        
-        # get model specific transforms (normalization, resize)
-        data_config = timm.data.resolve_model_data_config(model)
-        transform = timm.data.create_transform(**data_config, is_training=False)
-        return model, transform
-
-def get_dataset(dataset):
-    if dataset=="coco":
-        cap = dset.CocoCaptions(root = COCO_ROOT,
-                        annFile = COCO_ANN)#,
-                        #transform=transforms.Compose([
-                            # transforms.Resize((256,256)), 
-                            # transforms.RandomResizedCrop((224,224)), 
-                            #transforms.PILToTensor()]),)
-                            # target_transform=select_first_k_captions)
-    elif dataset=="nocaps":
-        cap = dset.CocoCaptions(root = NOCAPS_ROOT,
-                        annFile = NOCAPS_ANN,
-                        transform=transforms.Compose([
-                            #transforms.Resize((256,256)), 
-                            #transforms.RandomResizedCrop((224,224)), 
-                            transforms.PILToTensor()]),)
-    return cap 
-
-def run_model(model_name, model_transform, cap, device):
-    if model_name == "dinov2":
-        model, processor = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):          
-            inputs = processor(images=img, return_tensors="pt")
-            inputs = inputs.to(device)
-            outputs = model(**inputs)
-            image_representation = outputs.last_hidden_state.mean(dim=1).detach().cpu()[0]
-            image_representations.append(image_representation)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif "resnet101" == model_name:
-        model = model_transform
-        image_representations = []
-        for img, target in tqdm(cap):
-            inputs = feature_extractor(img, return_tensors="pt")
-            inputs = inputs.to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features.last_hidden_state.reshape((1, 2048, -1)).mean(dim=-1).detach().cpu()[0]
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif "detr_resnet_50_backbone" == model_name or "detr_resnet_101_backbone" == model_name:
-        model = model_transform
-        image_representations = []
-        for img, target in tqdm(cap):
-            inputs = image_processor(images=img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features[-1][0].reshape((1, 2048, -1)).mean(dim=-1).detach().cpu()[0]
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif "detr_resnet" in model_name:
-        model = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            inputs = image_processor(images=img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features.last_hidden_state.mean(dim=1).detach().cpu()[0]
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "vit":
-        model, transform = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            input = transform(img).unsqueeze(0).to(device)
-            with torch.no_grad():
-                output = model(input)[0]  # output is (batch_size, num_features) shaped tensor
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "sam":
-        model = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            inputs = processor(img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features[0].reshape(1, -1, 1280).mean(dim = 1).detach().cpu()[0]
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "sam_embed":
-        model = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            inputs = processor(img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features.reshape(-1, 256).mean(dim = 0).detach().cpu()
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "segformer" or model_name == "segformer_segment":
-        model = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            inputs = processor(img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features.last_hidden_state.reshape((1, 256, -1)).mean(-1).detach().cpu()[0]
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "dpt":
-        model = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            inputs = processor(img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            output = extractor.extracted_features.last_hidden_state.mean(dim=1).detach().cpu()[0]
-            image_representations.append(output)
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "convnext":
-        model = model_transform
-        image_representations = []
-    
-        for img, target in tqdm(cap):
-            
-            inputs = processor(images=img, return_tensors="pt")
-            inputs = inputs.to(device)
-            outputs = model.convnext(**inputs)
-            #print(outputs.last_hidden_state.shape)
-            image_representation = outputs.last_hidden_state.reshape(1, 1024, -1).mean(2).detach().cpu()[0]
-            image_representation = image_representation / np.linalg.norm(image_representation, axis=0, keepdims=True)
-            image_representations.append(image_representation)
-
-        image_representations_tensor = torch.stack(image_representations)
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "clip":
-        model, processor = model_transform
-        image_representations = []
-        text_representations = []
-        
-        for img, target in tqdm(cap):
-            
-            inputs = processor(text=target, images=img, return_tensors="pt", padding=True)
-            inputs = inputs.to(device)
-            outputs = model(**inputs)
-            text_representation = outputs.text_embeds.detach().cpu().squeeze()
-            text_representation = text_representation.mean(dim=0).squeeze()
-            image_representation = outputs.image_embeds.detach().cpu().squeeze()
-        
-            text_representations.append(text_representation)
-            image_representations.append(image_representation)
-
-        text_representations_tensor = torch.stack(text_representations)
-        image_representations_tensor = torch.stack(image_representations)
-
-        torch.save(text_representations_tensor, f'data/{dataset}_{model_name}_text.pt')
-        torch.save(image_representations_tensor, f'data/{dataset}_{model_name}_img.pt')
-    elif model_name == "allroberta":
-        language_model = model_transform
-        text_representations = []
-
-        for img, target in tqdm(cap):
-            output = language_model.encode(target)
-            text_representation = torch.Tensor(output)
-            text_representation = text_representation.mean(dim=0)
-            text_representations.append(text_representation)
-            
-        text_representations_tensor = torch.stack(text_representations)
-        torch.save(text_representations_tensor, f'data/{dataset}_{model_name}_text.pt')
-
-if __name__ == "__main__":
-    args = parse_args()
-
-    gpu = f'cuda:{args.gpu}'
-    device = torch.device(gpu)
-    torch.cuda.empty_cache()
-
-    model_name = args.model_name
-    dataset = args.dataset
-
-    model_transform = get_model(model_name, device)
-    cap = get_dataset(dataset)
-    run_model(model_name, model_transform, cap, device)
-
-    
-
-    
-    
-    
-
-    
-        
-    
+    return images_dir, ann_file
 
 
+def build_transform(image_size=224):
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    return transform
 
+
+class CocoWrapper(CocoCaptions):
+    """
+    Wraps CocoCaptions to return (PIL image, caption_text_list, image_id)
+    so mapping back to image ids is straightforward.
+    """
+    def __init__(self, root, annFile, transform=None):
+        super().__init__(root=root, annFile=annFile)
+        self.transform = transform
+
+    def __getitem__(self, index):
+        img, target = super().__getitem__(index)
+        img_id = self.ids[index]
+        if self.transform is not None:
+            img = self.transform(img)
+        # target is a list of caption strings
+        return img, target, img_id
+
+
+def load_clip_openai(device):
+    """
+    Try loading OpenAI CLIP package model+preprocess.
+    """
+    try:
+        import clip
+        model, preprocess = clip.load('ViT-B/32', device=device)
+        model.eval()
+        return (model, preprocess), model.visual.output_dim
+    except Exception:
+        # Try HF CLIP
+        try:
+            from transformers import CLIPVisionModel, CLIPProcessor
+            model = CLIPVisionModel.from_pretrained('openai/clip-vit-base-patch32').to(device)
+            proc = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+            model.eval()
+            return (model, proc), model.config.hidden_size
+        except Exception as e:
+            raise ImportError("Could not load CLIP (openai clip or hf). Install one.")
+
+
+def load_model(model_name, device):
+    """
+    Load supported models and return (model_or_tuple, feat_dim_or_None)
+
+    model_or_tuple can be:
+     - (model, preprocess) for CLIP style
+     - model only for simple torch models
+    """
+    model_name = model_name.lower()
+    # DINOv2 via timm / huggingface - try timm first
+    if model_name == 'dinov2':
+        try:
+            import timm
+            # try a common dinov2 variant, fallback to ViT if not present
+            try:
+                m = timm.create_model('dinov2_vit_base', pretrained=True, num_classes=0, global_pool='avg')
+            except Exception:
+                m = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=0, global_pool='avg')
+            m.eval()
+            m.to(device)
+            # many timm ViT models output 768-d features; but this may vary
+            return m, None
+        except Exception as e:
+            raise ImportError("timm is required for dinov2/vit support. pip install timm")
+
+    if model_name == 'clip':
+        return load_clip_openai(device)
+
+    if model_name in ('resnet50', 'resnet'):
+        try:
+            import torchvision.models as models
+        except Exception:
+            raise ImportError('torchvision is required to load ResNet models')
+        m = models.resnet50(pretrained=True)
+        m.fc = torch.nn.Identity()
+        m.eval()
+        m.to(device)
+        return m, 2048
+
+    # fallback: try timm for arbitrary model_name
+    try:
+        import timm
+        m = timm.create_model(model_name, pretrained=True, num_classes=0, global_pool='avg')
+        m.eval()
+        m.to(device)
+        return m, None
+    except Exception:
+        raise ValueError(f'Unsupported model: {model_name}. Install timm or use resnet50/clip/dinov2')
+
+
+def extract_embeddings(model_tuple, dataloader, device, out_file, model_name):
+    """
+    Runs images through the model and writes embeddings + image ids to out_file (.pt)
+    model_tuple: if CLIP returns (model, preprocess), else model alone.
+    """
+    model = model_tuple
+    preprocess = None
+    is_clip = False
+    if isinstance(model_tuple, tuple) and len(model_tuple) == 2:
+        model, preprocess = model_tuple
+        if hasattr(model, 'encode_image') or hasattr(model, 'visual'):
+            is_clip = True
+
+    emb_list = []
+    id_list = []
+    captions_list = []
+
+    model_device = device
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc='Extracting embeds'):
+            # For our CocoWrapper, batch is (list_of_imgs, list_of_targets, list_of_img_ids)
+            imgs, targets, img_ids = batch
+            # imgs may be a list of PIL or preprocessed tensors
+            if is_clip and preprocess is not None and not torch.is_tensor(imgs[0]):
+                # openai clip preprocess expects PIL per item
+                proc_tensors = [preprocess(img).unsqueeze(0) for img in imgs]
+                x = torch.cat(proc_tensors, dim=0).to(model_device)
+                # openai clip has encode_image
+                if hasattr(model, 'encode_image'):
+                    emb = model.encode_image(x).float().cpu()
+                else:
+                    # HF CLIP vision model returns last_hidden_state
+                    outputs = model(pixel_values=x)
+                    emb = outputs.last_hidden_state.mean(dim=1).cpu()
+            else:
+                # imgs are already tensors (assuming dataloader collate stacked)
+                if isinstance(imgs, (list, tuple)):
+                    imgs = torch.stack(imgs, dim=0)
+                x = imgs.to(model_device)
+                # Some timm models accept x and return (B, C) features
+                try:
+                    out = model(x)
+                except Exception:
+                    # try forward_features for timm/vit
+                    if hasattr(model, 'forward_features'):
+                        out = model.forward_features(x)
+                    else:
+                        out = model(x)
+                # If out has spatial dim, pool
+                if isinstance(out, torch.Tensor):
+                    if out.dim() == 4:
+                        emb = torch.nn.functional.adaptive_avg_pool2d(out, (1, 1)).squeeze(-1).squeeze(-1).cpu()
+                    else:
+                        emb = out.cpu()
+                else:
+                    # fallback: if model returns dict or object with last_hidden_state
+                    if hasattr(out, 'last_hidden_state'):
+                        emb = out.last_hidden_state.mean(dim=1).cpu()
+                    else:
+                        raise RuntimeError("Unknown model output format; please adapt extract_embeddings for your model.")
+            # embeddings and ids
+            # emb shape (B, D) ; img_ids length B
+            if emb.dim() == 1:
+                emb = emb.unsqueeze(0)
+            emb_list.append(emb)
+            # collect captions (targets) as simple list-of-lists of strings
+            captions_list.extend(targets)
+            id_list.extend(list(img_ids))
+
+    embeddings = torch.cat(emb_list, dim=0)
+    out = {
+        'image_ids': id_list,
+        'captions': captions_list,
+        'embeddings': embeddings,
+        'model_name': model_name,
+    }
+    torch.save(out, out_file)
+    print(f"Saved embeddings to: {out_file} (num={len(id_list)}, dim={embeddings.shape[1]})")
+
+# collate: return list of images, list of captions, list of ids
+def collate_fn(batch):
+    imgs = [b[0] for b in batch]
+    caps = [b[1] for b in batch]
+    ids = [b[2] for b in batch]
+    return imgs, caps, ids
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--m', '--model', dest='model', default='dinov2', help='model name: dinov2, clip, resnet50, or timm model name')
+    parser.add_argument('--d', '--dataset', dest='dataset', default='coco', help='dataset: coco (only supported in this script)')
+    parser.add_argument('--split', dest='split', default='val2017', help="coco split: train2017 or val2017")
+    parser.add_argument('--coco_root', dest='coco_root', default=None, help='path to coco_dataset folder (defaults to ./coco_dataset)')
+    parser.add_argument('--gpu', dest='gpu', default='0', help='GPU id or \"cpu\"')
+    parser.add_argument('--batch_size', dest='batch_size', type=int, default=32)
+    parser.add_argument('--out_dir', dest='out_dir', default='data')
+    parser.add_argument('--image_size', dest='image_size', type=int, default=224)
+    args = parser.parse_args()
+
+    if args.gpu == 'cpu' or not torch.cuda.is_available():
+        device = torch.device('cpu')
+    else:
+        device = torch.device(f'cuda:{args.gpu}')
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    if args.dataset.lower() != 'coco':
+        raise NotImplementedError('This helper currently only supports COCO via --d coco')
+
+    images_dir, ann_file = get_coco_paths(coco_root=args.coco_root, split=args.split)
+    print('Images dir:', images_dir)
+    print('Ann file  :', ann_file)
+
+    model_name = args.model.lower()
+    try:
+        model_tuple, feat_dim = load_model(model_name, device)
+    except Exception as e:
+        print('Error loading model:', e)
+        sys.exit(1)
+
+    # If using CLIP openai preprocess, we will pass None transform to dataset so item is PIL
+    preprocess = None
+    if isinstance(model_tuple, tuple) and len(model_tuple) == 2:
+        # likely (model, preprocess)
+        _, preprocess = model_tuple
+        transform = None
+    else:
+        transform = build_transform(image_size=args.image_size)
+
+    dataset = CocoWrapper(root=images_dir, annFile=ann_file, transform=transform)
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
+
+    out_file = os.path.join(args.out_dir, f'{args.dataset}_{model_name}_{args.split}_img.pt')
+    extract_embeddings(model_tuple, dataloader, device, out_file, model_name)
+
+
+if __name__ == '__main__':
+    main()
