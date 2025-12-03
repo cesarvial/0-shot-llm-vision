@@ -8,7 +8,7 @@ import os
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Config: adapt if needed
-EMBED_FILE = "data/coco_resnet50_val2017_img.pt"   # produced by get_embeds.py
+EMBED_FILE = "data/coco_resnet50_img.pt"   # produced by get_embeds.py
 COCO_ROOT = "./coco_dataset"                      # your project-local coco_dataset
 SPLIT = "val2017"
 

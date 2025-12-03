@@ -15,6 +15,10 @@ Usage examples:
   python get_embeds.py --m dinov2 --d coco --split val2017 --gpu 0
   python get_embeds.py --m clip --d coco --split train2017 --coco_root ./coco_dataset --batch_size 64
 
+  Nosso caso:
+  python get_embeds.py --m resnet50 --d coco --split val2017 --gpu 0 --batch_size 64
+  python get_embeds.py --m allroberta --d coco --split val2017 --gpu 0
+
 Notes:
  - You need `pycocotools`, `torch`, `torchvision`. For CLIP use `git+https://github.com/openai/CLIP.git` or `transformers`/`huggingface` equivalents.
  - If a model package is missing, the script will raise an ImportError describing what to install.
@@ -287,17 +291,76 @@ def main():
     print('Images dir:', images_dir)
     print('Ann file  :', ann_file)
 
+        # ---------- REPLACEMENT START ----------
     model_name = args.model.lower()
+
+    # If user asked for a text encoder (allroberta), run a text-embedding pipeline
+    if model_name == 'allroberta':
+        # we will compute per-image text embeddings by averaging the caption embeddings
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as e:
+            print("sentence-transformers is required for --m allroberta. Install with: pip install sentence-transformers")
+            sys.exit(1)
+
+        print("Loading SentenceTransformer all-roberta-large-v1 (this may download ~1.4GB)...")
+        st_model = SentenceTransformer('all-roberta-large-v1')  # blocks while downloading
+
+        # Build COCO dataset with no image transform (we only use captions)
+        dataset = CocoWrapper(root=images_dir, annFile=ann_file, transform=None)
+
+        # Windows-safe default: use num_workers=0 to avoid pickling issues
+        num_workers = 0 if os.name == 'nt' else 4
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        )
+
+        print("Encoding captions to text embeddings (this may take a while)...")
+        image_ids_out = []
+        text_emb_list = []
+
+        # For each image, dataset returns (img, captions_list, img_id)
+        # We encode each image's caption list and average (convert_to_tensor -> torch)
+        for imgs, captions_batch, img_ids in tqdm(dataloader, desc='Encoding captions'):
+            # captions_batch is list of lists
+            for captions_for_img, img_id in zip(captions_batch, img_ids):
+                # captions_for_img is a list of strings (may be empty)
+                if len(captions_for_img) == 0:
+                    emb = st_model.encode("", convert_to_tensor=True)
+                else:
+                    # encode all captions for this image, then average
+                    encs = st_model.encode(captions_for_img, convert_to_tensor=True)
+                    # encs shape (num_caps, dim)
+                    emb = encs.mean(dim=0)
+                text_emb_list.append(emb.cpu())
+                image_ids_out.append(img_id)
+
+        text_embeddings = torch.stack(text_emb_list, dim=0)  # (N, D)
+        out_file = os.path.join(args.out_dir, f'{args.dataset}_{model_name}_{args.split}_text.pt')
+        os.makedirs(args.out_dir, exist_ok=True)
+        torch.save({
+            'image_ids': image_ids_out,
+            'text_embeddings': text_embeddings,
+            'model_name': model_name
+        }, out_file)
+        print(f"Saved text embeddings to: {out_file}  shape: {text_embeddings.shape}")
+        sys.exit(0)
+
+    # Otherwise proceed to load a vision model and extract image embeddings
     try:
         model_tuple, feat_dim = load_model(model_name, device)
     except Exception as e:
         print('Error loading model:', e)
         sys.exit(1)
 
-    # If using CLIP openai preprocess, we will pass None transform to dataset so item is PIL
+    # Determine transform: CLIP preprocess or generic transform
     preprocess = None
     if isinstance(model_tuple, tuple) and len(model_tuple) == 2:
-        # likely (model, preprocess)
         _, preprocess = model_tuple
         transform = None
     else:
@@ -305,10 +368,14 @@ def main():
 
     dataset = CocoWrapper(root=images_dir, annFile=ann_file, transform=transform)
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
+    # Windows-safe default: num_workers = 0 to avoid pickling issues if on Windows
+    num_workers = 0 if os.name == 'nt' else 4
 
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
     out_file = os.path.join(args.out_dir, f'{args.dataset}_{model_name}_{args.split}_img.pt')
     extract_embeddings(model_tuple, dataloader, device, out_file, model_name)
+    # ---------- REPLACEMENT END ----------
+
 
 
 if __name__ == '__main__':

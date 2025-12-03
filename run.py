@@ -15,6 +15,18 @@ DATA_LOCATION = "./data"
 AVG_RESULT_LOCATION = "./result"
 SEEDWISE_RESULT_LOCATION = "./seedwise"
 
+def move_to_device(obj, device):
+    """Recursively move tensors inside obj (tensor, dict, list, tuple) to device."""
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [move_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(move_to_device(v, device) for v in obj)
+    return obj
+
 def parse_args():
     """
     Parse the following arguments for a default parser
@@ -99,6 +111,28 @@ def parse_args():
     )
     return parser.parse_args()
 
+def extract_tensor(obj):
+    if torch.is_tensor(obj):
+        return obj
+    if isinstance(obj, dict):
+        # Try common key names first
+        for k in ('text_embeddings', 'text_representations', 'text_embeds', 'text_embeds', 
+                  'text_embeddings', 'embeddings', 'image_representations', 'image_embeddings',
+                  'image_reps', 'emb'):
+            if k in obj and torch.is_tensor(obj[k]):
+                return obj[k]
+        # fallback: recursive search
+        for v in obj.values():
+            t = extract_tensor(v)
+            if t is not None:
+                return t
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            t = extract_tensor(v)
+            if t is not None:
+                return t
+    return None
+
 if __name__ == "__main__":
     args = parse_args()
 
@@ -113,24 +147,106 @@ if __name__ == "__main__":
     base_data = args.base_data
     query_data = args.query_data
     vtl = args.vtl
+    
+    map_loc = 'cpu'  # always safe to load to CPU first
 
-    
     if not vtl:
-        source_base_large = torch.load(f"{DATA_LOCATION}/{base_data}_{source_model}_text.pt", map_location=gpu).to(device)
-        target_base_large = torch.load(f"{DATA_LOCATION}/{base_data}_{target_model}_img.pt", map_location=gpu).to(device)
-        source_query_large = torch.load(f"{DATA_LOCATION}/{query_data}_{source_model}_text.pt", map_location=gpu).to(device)
-        target_query_large = torch.load(f"{DATA_LOCATION}/{query_data}_{target_model}_img.pt", map_location=gpu).to(device)
-    
-        source_base_cluster = torch.load(f"{DATA_LOCATION}/{base_data}_{source_model}_text_cluster.pt", map_location=gpu)
-        target_base_cluster = torch.load(f"{DATA_LOCATION}/{base_data}_{target_model}_img_cluster.pt", map_location=gpu)
+        # Text and image "large" objects
+        loaded = torch.load(f"{DATA_LOCATION}/{base_data}_{source_model}_text.pt", map_location=map_loc)
+        source_base_large = extract_tensor(loaded)
+        if source_base_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{base_data}_{source_model}_text.pt")
+        source_base_large = source_base_large.to(device)
+
+        loaded = torch.load(f"{DATA_LOCATION}/{base_data}_{target_model}_img.pt", map_location=map_loc)
+        target_base_large = extract_tensor(loaded)
+        if target_base_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{base_data}_{target_model}_img.pt")
+        target_base_large = target_base_large.to(device)
+
+        loaded = torch.load(f"{DATA_LOCATION}/{query_data}_{source_model}_text.pt", map_location=map_loc)
+        source_query_large = extract_tensor(loaded)
+        if source_query_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{query_data}_{source_model}_text.pt")
+        source_query_large = source_query_large.to(device)
+
+        loaded = torch.load(f"{DATA_LOCATION}/{query_data}_{target_model}_img.pt", map_location=map_loc)
+        target_query_large = extract_tensor(loaded)
+        if target_query_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{query_data}_{target_model}_img.pt")
+        target_query_large = target_query_large.to(device)
+
+        # clusters: they may or may not exist; handle missing files gracefully
+        src_cluster_path = f"{DATA_LOCATION}/{base_data}_{source_model}_text_cluster.pt"
+        tgt_cluster_path = f"{DATA_LOCATION}/{base_data}_{target_model}_img_cluster.pt"
+        if os.path.exists(src_cluster_path):
+            loaded = torch.load(src_cluster_path, map_location=map_loc, weights_only=False)
+            source_base_cluster = extract_tensor(loaded)
+            if source_base_cluster is not None:
+                source_base_cluster = source_base_cluster.to(device)
+            else:
+                source_base_cluster = None
+        else:
+            source_base_cluster = None
+
+        if os.path.exists(tgt_cluster_path):
+            loaded = torch.load(tgt_cluster_path, map_location=map_loc, weights_only=False)
+            target_base_cluster = extract_tensor(loaded)
+            if target_base_cluster is not None:
+                target_base_cluster = target_base_cluster.to(device)
+            else:
+                target_base_cluster = None
+        else:
+            target_base_cluster = None
+
     else:
-        target_base_large  = torch.load(f"{DATA_LOCATION}/{base_data}_{source_model}_text.pt", map_location=gpu).to(device)
-        source_base_large= torch.load(f"{DATA_LOCATION}/{base_data}_{target_model}_img.pt", map_location=gpu).to(device)
-        target_query_large = torch.load(f"{DATA_LOCATION}/{query_data}_{source_model}_text.pt", map_location=gpu).to(device)
-        source_query_large = torch.load(f"{DATA_LOCATION}/{query_data}_{target_model}_img.pt", map_location=gpu).to(device)
-    
-        target_base_cluster = torch.load(f"{DATA_LOCATION}/{base_data}_{source_model}_text_cluster.pt", map_location=gpu)
-        source_base_cluster = torch.load(f"{DATA_LOCATION}/{base_data}_{target_model}_img_cluster.pt", map_location=gpu)
+        # vtl branch (vision-to-language) loads reversed roles; same extraction logic
+        loaded = torch.load(f"{DATA_LOCATION}/{base_data}_{source_model}_text.pt", map_location=map_loc)
+        target_base_large = extract_tensor(loaded)
+        if target_base_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{base_data}_{source_model}_text.pt")
+        target_base_large = target_base_large.to(device)
+
+        loaded = torch.load(f"{DATA_LOCATION}/{base_data}_{target_model}_img.pt", map_location=map_loc)
+        source_base_large = extract_tensor(loaded)
+        if source_base_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{base_data}_{target_model}_img.pt")
+        source_base_large = source_base_large.to(device)
+
+        loaded = torch.load(f"{DATA_LOCATION}/{query_data}_{source_model}_text.pt", map_location=map_loc)
+        target_query_large = extract_tensor(loaded)
+        if target_query_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{query_data}_{source_model}_text.pt")
+        target_query_large = target_query_large.to(device)
+
+        loaded = torch.load(f"{DATA_LOCATION}/{query_data}_{target_model}_img.pt", map_location=map_loc)
+        source_query_large = extract_tensor(loaded)
+        if source_query_large is None:
+            raise RuntimeError(f"No tensor found in {DATA_LOCATION}/{query_data}_{target_model}_img.pt")
+        source_query_large = source_query_large.to(device)
+
+        # cluster paths (vtl)
+        tgt_cluster_path = f"{DATA_LOCATION}/{base_data}_{source_model}_text_cluster.pt"
+        src_cluster_path = f"{DATA_LOCATION}/{base_data}_{target_model}_img_cluster.pt"
+        if os.path.exists(tgt_cluster_path):
+            loaded = torch.load(tgt_cluster_path, map_location=map_loc, weights_only=False)
+            target_base_cluster = extract_tensor(loaded)
+            if target_base_cluster is not None:
+                target_base_cluster = target_base_cluster.to(device)
+            else:
+                target_base_cluster = None
+        else:
+            target_base_cluster = None
+
+        if os.path.exists(src_cluster_path):
+            loaded = torch.load(src_cluster_path, map_location=map_loc, weights_only=False)
+            source_base_cluster = extract_tensor(loaded)
+            if source_base_cluster is not None:
+                source_base_cluster = source_base_cluster.to(device)
+            else:
+                source_base_cluster = None
+        else:
+            source_base_cluster = None
 
     base_samples = args.base_samples
     query_samples = args.query_samples
@@ -272,10 +388,3 @@ if __name__ == "__main__":
                                columns=avg_col)
     avg_df.to_csv(f"{AVG_RESULT_LOCATION}/{name}.csv", index=False)
     
-
-    
-        
-    
-
-
-

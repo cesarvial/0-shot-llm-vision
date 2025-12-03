@@ -13,3 +13,5 @@ pycocotools
 matplotlib
 gradcam
 opencv-python
+timm
+sentence-transformers
