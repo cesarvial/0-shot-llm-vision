@@ -2,3 +2,4 @@ coco_dataset/annotations/*
 coco_dataset/val2017/*
 coco_dataset/train2017/*
 XAI_results/*
+data/*

@@ -1,4 +1,0 @@
-Base data,Query data,Source model,Target model,method,base_samples,query_samples,clustering_mode,stretch,seed1,seed2,matching_acc,top_1,top_5,top_10
-coco,coco,allroberta,resnet50,linear,320,500,0,False,0,0,0.202,0.144,0.426,0.622
-coco,coco,allroberta,resnet50,linear,320,500,0,False,0,1,0.198,0.154,0.426,0.612
-coco,coco,allroberta,resnet50,linear,320,500,0,False,0,2,0.212,0.176,0.476,0.634

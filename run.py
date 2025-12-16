@@ -1,3 +1,7 @@
+"""
+python run.py --m linear --b 320 --q 500 --c 0 --vid_model resnet50 --text_model allroberta --base_data coco --query_data coco --gpu 0
+"""
+
 import numpy as np
 from sklearn import datasets, cluster
 import torch
@@ -7,7 +11,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import KMeans
 import pandas as pd
-from src.utils import * 
+from utils import * 
 import argparse
 from datetime import datetime
 
